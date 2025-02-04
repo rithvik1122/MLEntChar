@@ -12,6 +12,7 @@ import os  # Added to detect CPU cores
 import concurrent.futures  # New import for parallel processing
 from functools import partial  # Added import
 import torch.backends.cudnn as cudnn  # New import
+import torch.nn.functional as F  # Add this import at the top
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -41,12 +42,34 @@ def check_gpu_availability():
         print("\nWarning: CUDA is not available. Using CPU.")
         print(f"PyTorch version: {torch.__version__}")
 
-def check_cpu_cores():
-    import os
-    total_cores = os.cpu_count()
-    use_cores = max(1, int(total_cores * 0.8))
-    print(f"Using {use_cores} CPU cores (80% of {total_cores}).")
-    torch.set_num_threads(use_cores)
+def get_optimal_workers():
+    cpu_cores = os.cpu_count()
+    # Use 90% of available CPU cores for CPU-bound operations
+    optimal_cpu_workers = max(2, int(cpu_cores * 0.9))
+    print(f"Detected {cpu_cores} CPU cores, using {optimal_cpu_workers} workers")
+    return optimal_cpu_workers
+
+def get_dataloader_workers():
+    cpu_cores = os.cpu_count()
+    if torch.cuda.is_available():
+        # For GPU operations, use fewer workers to avoid CPU-GPU bottleneck
+        return max(2, min(8, cpu_cores // 4))
+    else:
+        # For CPU operations, use more workers
+        return max(2, int(cpu_cores * 0.8))
+
+def get_gpu_info():
+    if torch.cuda.is_available():
+        gpu_count = torch.cuda.device_count()
+        total_cuda_cores = 0
+        for i in range(gpu_count):
+            props = torch.cuda.get_device_properties(i)
+            total_cuda_cores += props.multi_processor_count * 64  # Approximate CUDA cores per SM
+            print(f"GPU {i}: {props.name}")
+            print(f"Memory: {props.total_memory / 1e9:.2f} GB")
+            print(f"CUDA Cores: ~{props.multi_processor_count * 64}")
+        return gpu_count, total_cuda_cores
+    return 0, 0
 
 def generate_mubs():
     M0 = np.eye(4)
@@ -331,94 +354,58 @@ def _single_mle_estimation(measurements, povms, max_iter=2000):
 def _parallel_mle_worker(m, povms, max_iter):
     return _single_mle_estimation(m, povms, max_iter)
 
-def parallel_mle_estimator(X, povms, max_iter=2000, num_workers=8):
-    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+def parallel_mle_estimator(X, povms, max_iter=2000):
+    # Use more workers for CPU-bound MLE computation
+    optimal_workers = get_optimal_workers()
+    print(f"Running MLE estimation with {optimal_workers} workers")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=optimal_workers) as executor:
         results = list(executor.map(partial(_parallel_mle_worker, povms=povms, max_iter=max_iter), X))
     return results
 
-def _single_bayesian_estimation(measurements, povms, max_iter=3000):
-    # Extract code from the loop in bayesian_estimator that processes one measurement sample.
-    negativities = []
-    povms = povms[:len(measurements)]
+def _single_bayesian_estimation(measurements, povms, max_iter=1000):
+    """
+    Simplified Bayesian estimation using maximum entropy principle
+    """
+    # Initialize with maximally mixed state
+    rho = np.eye(16) / 16
     
-    try:
-        # Multiple initializations
-        best_fidelity = -np.inf
-        best_rho = None
+    # Simple Bayesian update loop
+    for _ in range(max_iter):
+        # Compute likelihood updates
+        R = np.zeros((16, 16), dtype=np.complex128)
         
-        for init_attempt in range(3):
-            if init_attempt == 0:
-                rho = np.eye(16) / 16
-            elif init_attempt == 1:
-                # Better initialization for pure states
-                psi = np.random.normal(0, 1, 16) + 1j * np.random.normal(0, 1, 16)
-                psi = psi / (np.linalg.norm(psi) + 1e-10)
-                rho = np.outer(psi, psi.conj())
-            else:
-                rho = randomHaarState(16, 2)
-            
-            # Ensure valid initial state
-            rho = 0.5 * (rho + rho.conj().T)
-            rho = rho / (np.trace(rho) + 1e-10)
-            
-            # New modifications: Adjust temperature schedule
-            T = 2.5  # Increased initial temperature
-            cooling_rate = 0.995  # Slower cooling rate
-            
-            for _ in range(max_iter):
-                try:
-                    R = np.zeros((16, 16), dtype=np.complex128)
-                    fidelity = 0
-                    
-                    for m, povm in zip(measurements, povms):
-                        prob = max(np.real(np.trace(rho @ povm)), 1e-15)
-                        # More stable likelihood computation
-                        likelihood = np.exp(-np.clip((m - prob) ** 2 / (2 * T * T), -50, 50))
-                        R += likelihood * povm
-                        fidelity += likelihood
-                    
-                    trace_R = np.trace(R)
-                    if abs(trace_R) < 1e-15:
-                        continue
-                        
-                    new_rho = R / trace_R
-                    new_rho = 0.5 * (new_rho + new_rho.conj().T)
-                    new_trace = np.trace(new_rho)
-                    
-                    if abs(new_trace) < 1e-15:
-                        continue
-                        
-                    new_rho = new_rho / new_trace
-                    
-                    # Add regularization
-                    noise = np.eye(16) / 16
-                    new_rho = 0.98 * new_rho + 0.02 * noise
-                    
-                    if fidelity > best_fidelity and np.all(np.isfinite(new_rho)):
-                        best_fidelity = fidelity
-                        best_rho = new_rho.copy()
-                    
-                    if np.max(np.abs(new_rho - rho)) < 1e-8:
-                        break
-                        
-                    rho = new_rho
-                    T = max(0.1, T * cooling_rate)  # T decreases more slowly now
-                    
-                except (np.linalg.LinAlgError, RuntimeWarning):
-                    continue
-                    
-        negativities.append(entanglement_negativity(best_rho) if best_rho is not None else 0.0)
+        for m, povm in zip(measurements, povms[:len(measurements)]):
+            prob = max(np.real(np.trace(rho @ povm)), 1e-10)
+            R += (m / prob) * povm
         
-    except Exception:
-        negativities.append(0.0)
+        # Update state estimate
+        new_rho = R @ rho @ R
+        new_rho = 0.5 * (new_rho + new_rho.conj().T)  # Ensure Hermiticity
+        trace = np.trace(new_rho)
+        if trace < 1e-10:  # Numerical stability check
+            break
+        new_rho = new_rho / trace
         
-    return entanglement_negativity(best_rho) if best_rho is not None else 0.0
+        # Check convergence
+        if np.max(np.abs(new_rho - rho)) < 1e-6:
+            break
+            
+        rho = new_rho
+    
+    # Add small amount of noise for stability
+    rho = 0.99 * rho + 0.01 * (np.eye(16) / 16)
+    return entanglement_negativity(rho)
 
 def _parallel_bayesian_worker(m, povms, max_iter):
     return _single_bayesian_estimation(m, povms, max_iter)
 
-def parallel_bayesian_estimator(X, povms, max_iter=3000, num_workers=8):
-    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+def parallel_bayesian_estimator(X, povms, max_iter=1000):
+    """
+    Parallel implementation of simplified Bayesian estimator
+    """
+    optimal_workers = get_optimal_workers()
+    print(f"Running simplified Bayesian estimation with {optimal_workers} workers")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=optimal_workers) as executor:
         results = list(executor.map(partial(_parallel_bayesian_worker, povms=povms, max_iter=max_iter), X))
     return results
 
@@ -456,42 +443,48 @@ class MLP(nn.Module):
 class CNN(nn.Module):
     def __init__(self, input_size):
         super(CNN, self).__init__()
+        # Reshape input into 2D structure to better capture measurement correlations
+        self.reshape_dim = int(np.sqrt(input_size)) + 1
         self.conv = nn.Sequential(
-            nn.Conv1d(1, 32, kernel_size=3, padding=1),
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Dropout(0.05),  # Reduced dropout from 0.1 to 0.05
-            nn.BatchNorm1d(32),
-            nn.Conv1d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Dropout(0.05),  # Reduced dropout from 0.1 to 0.05
-            nn.BatchNorm1d(64),
-            nn.AdaptiveAvgPool1d(8)
+            nn.BatchNorm2d(64)
         )
+        # Add adaptive pooling to handle variable input sizes
+        self.pool = nn.AdaptiveAvgPool2d((4, 4))
         self.fc = nn.Sequential(
-            nn.Linear(64 * 8, 128),
+            nn.Linear(64 * 16, 256),
             nn.ReLU(),
-            nn.BatchNorm1d(128),
-            nn.Linear(128, 1)
+            nn.BatchNorm1d(256),
+            nn.Linear(256, 1)
         )
 
     def forward(self, x):
-        x = x.unsqueeze(1)
+        # Reshape to 2D grid
+        batch_size = x.size(0)
+        x = F.pad(x, (0, self.reshape_dim**2 - x.size(1)))
+        x = x.view(batch_size, 1, self.reshape_dim, self.reshape_dim)
         x = self.conv(x)
-        x = x.view(x.size(0), -1)
+        x = self.pool(x)
+        x = x.view(batch_size, -1)
         return self.fc(x)
 
 class Transformer(nn.Module):
-    def __init__(self, input_size, embed_dim=128, num_heads=8, num_layers=4):
+    def __init__(self, input_size, embed_dim=256):
         super(Transformer, self).__init__()
-        self.embedding = nn.Linear(input_size, embed_dim)
+        self.embedding = nn.Linear(1, embed_dim)  # Embed each measurement individually
+        self.pos_encoding = nn.Parameter(torch.randn(1, input_size, embed_dim))
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, 
-            nhead=num_heads,
-            dim_feedforward=1024,  # Increased from 512 to 1024 for higher capacity
-            dropout=0.03,          # Reduced dropout from 0.05 to 0.03
-            batch_first=True  # Add this parameter
+            d_model=embed_dim,
+            nhead=8,
+            dim_feedforward=1024,
+            dropout=0.1,
+            batch_first=True
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=6)
         self.fc = nn.Sequential(
             nn.Linear(embed_dim, 128),
             nn.ReLU(),
@@ -500,10 +493,12 @@ class Transformer(nn.Module):
         )
 
     def forward(self, x):
-        x = self.embedding(x)
-        x = x.unsqueeze(1)  # Add batch dimension first
+        # Reshape to treat each measurement individually
+        x = x.unsqueeze(-1)  # [batch, seq_len, 1]
+        x = self.embedding(x)  # [batch, seq_len, embed_dim]
+        x = x + self.pos_encoding
         x = self.transformer(x)
-        x = x.mean(dim=1)
+        x = torch.mean(x, dim=1)  # Global pooling
         return self.fc(x)
 
 class CustomDataset(data.Dataset):
@@ -535,7 +530,7 @@ def train_model(model, X_train, Y_train, X_val, Y_val, num_measurements, batch_s
         batch_size=batch_size, 
         shuffle=True,
         pin_memory=True if torch.cuda.is_available() else False,
-        num_workers=4,
+        num_workers=get_dataloader_workers(),
         prefetch_factor=4  # Adjusted for faster data loading
     )
     
@@ -544,7 +539,7 @@ def train_model(model, X_train, Y_train, X_val, Y_val, num_measurements, batch_s
         val_dataset, 
         batch_size=batch_size,
         pin_memory=True if torch.cuda.is_available() else False,
-        num_workers=4
+        num_workers=get_dataloader_workers()
     )
     
     # Adjust learning rate based on number of measurements
@@ -673,7 +668,7 @@ def predict_in_batches(model, X, batch_size=1024):
         dataset, 
         batch_size=batch_size,
         pin_memory=True,
-        num_workers=4
+        num_workers=get_dataloader_workers()
     )
     predictions = []
     
@@ -693,12 +688,12 @@ def main():
         cudnn.benchmark = True
 
     check_gpu_availability()
-    # Print GPU information
-    print(f"Using device: {device}")
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-    
+    optimal_workers = get_optimal_workers()
+    gpu_count, cuda_cores = get_gpu_info()
+    print(f"Available GPU(s): {gpu_count}")
+    if gpu_count > 0:
+        print(f"Total CUDA cores: ~{cuda_cores}")
+
     # Start total runtime timer
     total_start_time = time.time()
     
