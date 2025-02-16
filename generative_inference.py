@@ -13,15 +13,8 @@ def load_model(checkpoint_path, measurement_dim, latent_dim, density_dim):
     return model
 
 def generate_density_matrix(model, measurements):
-    # Generate the density matrix from a list of measurements
-    with torch.no_grad():
-        x = torch.FloatTensor(measurements).unsqueeze(0).to(device)  # Shape: [1, measurement_dim]
-        recon_dm, _, _ = model(x)
-        recon_dm = recon_dm.cpu().numpy()[0]
-        # Ensure Hermiticity and normalization
-        recon_dm = 0.5 * (recon_dm + recon_dm.conj().T)
-        recon_dm = recon_dm / np.trace(recon_dm)
-    return recon_dm
+    """Wrapper function to generate density matrix using the model's method"""
+    return model.generate_density_matrix(measurements)
 
 def main():
     parser = argparse.ArgumentParser(description="Generate full density matrix from few measurements")

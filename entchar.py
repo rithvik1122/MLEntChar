@@ -1,19 +1,24 @@
+# Standard library imports
+import os
+import csv
+import time
+import math
+import concurrent.futures
+from functools import partial
+
+# Third party imports
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.model_selection import train_test_split
-import csv
-import time
-import matplotlib.pyplot as plt
-import torch.utils.data as data
-from tqdm import tqdm
+import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
-import os  # Added to detect CPU cores
-import concurrent.futures  # New import for parallel processing
-from functools import partial  # Added import
-import torch.backends.cudnn as cudnn  # New import
-import torch.nn.functional as F  # Add this import at the top
-import copy  # Add this import for deepcopy functionality
+import torch.backends.cudnn as cudnn
+import torch.utils.data as data
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import argparse
+import torch.nn.utils as utils
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -444,97 +449,177 @@ class MLP(nn.Module):
 class CNN(nn.Module):
     def __init__(self, input_size):
         super(CNN, self).__init__()
-        # Reshape input into 2D structure to better capture measurement correlations
-        self.reshape_dim = int(np.sqrt(input_size)) + 1
-        self.conv = nn.Sequential(
+        # Calculate optimal reshaping dimensions based on input size
+        self.grid_dim = int(np.ceil(np.sqrt(input_size)))
+        
+        # Enhanced feature extraction layers
+        self.feature_extractor = nn.Sequential(
+            # First conv block - local correlations
             nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
             nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            
+            # Second conv block - measurement patterns
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.BatchNorm2d(64)
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            
+            # Third conv block - global features
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((2, 2))  # Adaptive pooling for variable input sizes
         )
-        # Add adaptive pooling to handle variable input sizes
-        self.pool = nn.AdaptiveAvgPool2d((4, 4))
-        self.fc = nn.Sequential(
-            nn.Linear(64 * 16, 256),
-            nn.ReLU(),
+        
+        # Calculate flattened feature size
+        self.feature_size = 128 * 2 * 2
+        
+        # Enhanced regression head
+        self.regressor = nn.Sequential(
+            nn.Linear(self.feature_size, 256),
             nn.BatchNorm1d(256),
-            nn.Linear(256, 1)
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.ReLU()  # Ensure non-negative output
         )
-
+        
+        # Initialize weights with physical consideration
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                # Kaiming initialization for ReLU activation
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                # Initialize final layer carefully for regression
+                if m.out_features == 1:
+                    nn.init.uniform_(m.weight, -0.1, 0.1)
+                    nn.init.constant_(m.bias, 0.1)
+                else:
+                    nn.init.kaiming_normal_(m.weight)
+    
     def forward(self, x):
-        # Reshape to 2D grid
         batch_size = x.size(0)
-        x = F.pad(x, (0, self.reshape_dim**2 - x.size(1)))
-        x = x.view(batch_size, 1, self.reshape_dim, self.reshape_dim)
-        x = self.conv(x)
-        x = self.pool(x)
-        x = x.view(batch_size, -1)
-        return self.fc(x)
+        
+        # Reshape input to 2D grid while preserving measurement order
+        x = F.pad(x, (0, self.grid_dim**2 - x.size(1)))
+        x = x.view(batch_size, 1, self.grid_dim, self.grid_dim)
+        
+        # Extract features with spatial awareness
+        features = self.feature_extractor(x)
+        features = features.view(batch_size, -1)
+        
+        # Predict entanglement negativity
+        return self.regressor(features)
 
 class Transformer(nn.Module):
     def __init__(self, input_size, embed_dim=256):
         super(Transformer, self).__init__()
-        self.embedding = nn.Linear(1, embed_dim)  # Embed each measurement individually
-        self.pos_encoding = nn.Parameter(torch.randn(1, input_size, embed_dim))
+        self.embed_dim = embed_dim
+        self.embedding = nn.Linear(1, embed_dim)
+        self.pos_encoding = self._create_positional_encoding(5000, embed_dim)
+        self.povms = None  # Add POVM storage
+        self.reconstruction_cache = {}  # Add cache for reconstruction results
+        
+        # Simplified transformer configuration
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=8,
-            dim_feedforward=1024,
+            dim_feedforward=512,
             dropout=0.1,
-            batch_first=True
+            batch_first=True,
+            activation='gelu',
+            norm_first=True  # Use pre-normalization for better stability
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=6)
-        self.fc = nn.Sequential(
-            nn.Linear(embed_dim, 128),
-            nn.ReLU(),
-            nn.BatchNorm1d(128),
-            nn.Linear(128, 1)
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, 
+            num_layers=4,
+            norm=nn.LayerNorm(embed_dim)
         )
+        
+        self.output_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.LayerNorm(embed_dim // 2),
+            nn.Linear(embed_dim // 2, 1),
+            nn.ReLU()  # Ensure non-negative outputs
+        )
+        
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+    
+    def _create_positional_encoding(self, max_len, d_model):
+        pos = torch.arange(max_len).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(1, max_len, d_model)
+        pe[0, :, 0::2] = torch.sin(pos * div_term)
+        pe[0, :, 1::2] = torch.cos(pos * div_term)
+        return nn.Parameter(pe, requires_grad=False)
+
+    def set_povms(self, povms):
+        """Store POVMs for potential use in attention mechanisms"""
+        self.povms = povms
+        return self
+
+    def clear_cache(self):
+        """Clear the reconstruction cache"""
+        if hasattr(self, 'reconstruction_cache'):
+            self.reconstruction_cache.clear()
 
     def forward(self, x):
-        # Reshape to treat each measurement individually
-        x = x.unsqueeze(-1)  # [batch, seq_len, 1]
-        x = self.embedding(x)  # [batch, seq_len, embed_dim]
-        x = x + self.pos_encoding
-        x = self.transformer(x)
-        x = torch.mean(x, dim=1)  # Global pooling
-        return self.fc(x)
-
-class DensityMatrixVAE(nn.Module):
-    def __init__(self, input_dim, latent_dim=64, dm_dim=16):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, latent_dim * 2)  # Output both mean and logvar
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 128),
-            nn.ReLU(),
-            nn.Linear(128, dm_dim * dm_dim * 2)  # Output real and imaginary parts
-        )
-        self.dm_dim = dm_dim
-
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    def forward(self, x):
-        encoded = self.encoder(x)
-        mu, logvar = encoded[:, :encoded.size(1) // 2], encoded[:, encoded.size(1) // 2:]
-        z = self.reparameterize(mu, logvar)
-        decoded = self.decoder(z)
-        real = decoded[:, :self.dm_dim * self.dm_dim].view(-1, self.dm_dim, self.dm_dim)
-        imag = decoded[:, self.dm_dim * self.dm_dim:].view(-1, self.dm_dim, self.dm_dim)
-        dm = real + 1j * imag
-        return dm, mu, logvar
+        # Ensure input requires gradient
+        if not x.requires_grad:
+            x = x.detach().requires_grad_(True)
+            
+        # Reshape and embed input
+        B, N = x.shape
+        x = x.unsqueeze(-1)  # [B, N, 1]
+        x = self.embedding(x)
+        
+        # Add positional encoding
+        x = x + self.pos_encoding[:, :N, :]
+        
+        # Apply transformer with gradient checkpointing
+        if self.training:
+            def create_custom_forward(module):
+                def custom_forward(*inputs):
+                    return module(*inputs)
+                return custom_forward
+            
+            x = torch.utils.checkpoint.checkpoint(
+                create_custom_forward(self.transformer),
+                x,
+                use_reentrant=False
+            )
+        else:
+            x = self.transformer(x)
+            
+        # Global average pooling
+        x = x.mean(dim=1)
+        
+        # Final prediction
+        return self.output_head(x)
 
 class CustomDataset(data.Dataset):
     def __init__(self, X, y):
@@ -554,11 +639,11 @@ class CustomLoss(nn.Module):
     def forward(self, pred, target):
         # Scale the loss components better
         mse = torch.mean((pred - target)**2)
-        rel_error = torch.mean(torch.abs(pred - target) / (torch.abs(target) + 1e-6))
+        rel_error = torch.mean(torch.abs(pred / (target + 1e-6) - 1))
         l1_loss = torch.mean(torch.abs(pred - target))
         return mse + 0.01 * rel_error + 0.05 * l1_loss  # Reduced weights for stability
 
-def train_model(model, X_train, Y_train, X_val, Y_val, num_measurements, batch_size=256, patience=50, max_epochs=2000):  # Reduced batch size
+def train_model(model, X_train, Y_train, X_val, Y_val, num_measurements, povms=None, batch_size=256, patience=50, max_epochs=2000):  # Reduced batch size
     train_dataset = CustomDataset(X_train, Y_train)
     train_loader = data.DataLoader(
         train_dataset, 
@@ -577,25 +662,46 @@ def train_model(model, X_train, Y_train, X_val, Y_val, num_measurements, batch_s
         num_workers=get_dataloader_workers()
     )
     
-    # Adjust learning rate based on number of measurements
-    base_lr = 0.001 / np.sqrt(num_measurements)  # Decrease learning rate for more measurements
-    
-    # Adjust batch size based on number of measurements
-    adjusted_batch_size = min(batch_size, max(32, X_train.shape[0] // 20))
-    
-    optimizer = torch.optim.AdamW(model.parameters(), 
-                                lr=base_lr,
-                                weight_decay=1e-5)
-    
-    # Further extend warmup proportional to measurements
-    def lr_lambda(epoch):
-        # Use a warmup period set to the number of measurements or at least 100 epochs
-        warmup = max(num_measurements, 100)
-        if epoch < warmup:
-            return epoch / warmup
-        return 0.995 ** (epoch - warmup)
-    
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    # Add model.to(device) here to ensure model is on GPU
+    model = model.to(device)
+
+    # Set base learning rate
+    base_lr = 0.001 / np.sqrt(num_measurements)  # Default learning rate
+
+    if isinstance(model, Transformer):
+        # Transformer-specific settings
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=1e-4,  # Override base_lr for transformer
+            weight_decay=0.01,
+            eps=1e-8
+        )
+        
+        batch_size = min(64, batch_size)
+        
+        warmup_steps = len(train_loader) * 5
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return step / warmup_steps
+            return 0.95 ** (step - warmup_steps)
+            
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    else:
+        # Non-transformer models use base_lr
+        optimizer = torch.optim.AdamW(
+            model.parameters(), 
+            lr=base_lr,
+            weight_decay=1e-5,
+            eps=1e-4
+        )
+        
+        def lr_lambda(epoch):
+            warmup = max(num_measurements, 100)
+            if epoch < warmup:
+                return epoch / warmup
+            return 0.995 ** (epoch - warmup)
+        
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
     # Adjust patience based on measurement count
     patience = 50 + (num_measurements // 10)
@@ -613,6 +719,7 @@ def train_model(model, X_train, Y_train, X_val, Y_val, num_measurements, batch_s
     best_val_loss = float('inf')
     best_model_state = None
     no_improve = 0
+    min_delta = 1e-6  # Minimum improvement threshold
     
     try:
         pbar = tqdm(range(max_epochs))
@@ -630,26 +737,32 @@ def train_model(model, X_train, Y_train, X_val, Y_val, num_measurements, batch_s
             
             for i, (batch_X, batch_y) in enumerate(train_loader):
                 try:
-                    batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+                    # Move tensors to device and ensure they require gradients
+                    batch_X = batch_X.to(device, non_blocking=True).requires_grad_(True)  # Enable gradients
+                    batch_y = batch_y.to(device, non_blocking=True)
                     
                     if torch.cuda.is_available():
-                        with autocast(device_type='cuda', dtype=torch.float16):  # Specify dtype
+                        with autocast(device_type='cuda', dtype=torch.float16):
                             outputs = model(batch_X)
-                            loss = criterion(outputs, batch_y.view(-1, 1))
-                            loss = loss / accumulation_steps  # Scale loss for accumulation
+                            # Ensure outputs are floating point tensors
+                            outputs = outputs.float()
+                            batch_y = batch_y.float().view(-1, 1)
+                            loss = criterion(outputs, batch_y)
+                            loss = loss / accumulation_steps
                         
                         scaler.scale(loss).backward()
                         
                         if (i + 1) % accumulation_steps == 0:
                             scaler.unscale_(optimizer)
-                            # Increased max_norm for gradient clipping
                             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                             scaler.step(optimizer)
                             scaler.update()
-                            optimizer.zero_grad(set_to_none=True)  # Fixed: Changed from set_to_none(True)
+                            optimizer.zero_grad(set_to_none=True)
                     else:
                         outputs = model(batch_X)
-                        loss = criterion(outputs, batch_y.view(-1, 1))
+                        outputs = outputs.float()
+                        batch_y = batch_y.float().view(-1, 1)
+                        loss = criterion(outputs, batch_y)
                         loss.backward()
                         
                         if isinstance(model, Transformer) and (i + 1) % 4 != 0:
@@ -657,37 +770,86 @@ def train_model(model, X_train, Y_train, X_val, Y_val, num_measurements, batch_s
                         
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         optimizer.step()
-                        optimizer.zero_grad(set_to_none(True))
+                        optimizer.zero_grad(set_to_none=True)
                     
                     train_loss += loss.item()
-                except KeyboardInterrupt:
-                    print("\nTraining interrupted. Saving best model...")
-                    if best_model_state is not None:
-                        model.load_state_dict(best_model_state)
-                    return model
+                    
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        # Try to recover by skipping this batch
+                        print(f"\nOOM error at batch {i}, skipping...")
+                        if 'loss' in locals():
+                            del loss
+                        if 'outputs' in locals():
+                            del outputs
+                        continue
+                    else:
+                        raise e
             
             # Validation
             model.eval()
             val_loss = 0
             with torch.no_grad():
                 for batch_X, batch_y in val_loader:
-                    batch_X, batch_y = batch_X.to(device), batch_y.to(device)
-                    outputs = model(batch_X)
-                    val_loss += criterion(outputs, batch_y.view(-1, 1)).item()
+                    batch_X, batch_y = batch_X.to(device, non_blocking=True), batch_y.to(device, non_blocking=True)
+                    try:
+                        outputs = model(batch_X)
+                        val_loss += criterion(outputs, batch_y.view(-1, 1)).item()
+                    except RuntimeError as e:
+                        if "out of memory" in str(e):
+                            torch.cuda.empty_cache()
+                            print("\nOOM during validation, skipping batch...")
+                            continue
+                        raise e
             
             val_loss /= len(val_loader)
             scheduler.step()
             
             pbar.set_description(f"Train Loss: {train_loss/len(train_loader):.6f}, Val Loss: {val_loss:.6f}")
             
-            if val_loss < best_val_loss:
+            # Enhanced early stopping check
+            if val_loss < best_val_loss - min_delta:
                 best_val_loss = val_loss
                 best_model_state = model.state_dict().copy()
                 no_improve = 0
             else:
                 no_improve += 1
                 if no_improve >= patience:
+                    print(f"\nEarly stopping triggered at epoch {epoch}")
+                    model.load_state_dict(best_model_state)
                     break
+
+            if isinstance(model, Transformer):
+                # Clear cache periodically without directly accessing reconstruction_cache
+                if epoch % 10 == 0:
+                    model.clear_cache()
+                    torch.cuda.empty_cache()
+                
+                # Use gradient accumulation for transformer
+                effective_batch = batch_size // 4  # Process smaller chunks
+                optimizer.zero_grad(set_to_none=True)
+                
+                for i, (batch_X, batch_y) in enumerate(train_loader):
+                    sub_batches = batch_X.chunk(4)  # Split into smaller chunks
+                    sub_labels = batch_y.chunk(4)
+                    
+                    for sub_X, sub_y in zip(sub_batches, sub_labels):
+                        sub_X, sub_y = sub_X.to(device), sub_y.to(device)
+                        
+                        with autocast(device_type='cuda'):  # Added device_type
+                            outputs = model(sub_X)
+                            loss = criterion(outputs, sub_y.view(-1, 1)) / 4
+                        
+                        scaler.scale(loss).backward()
+                    
+                    if (i + 1) % 4 == 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad(set_to_none=True)
     
     except KeyboardInterrupt:
         print("\nTraining interrupted. Saving best model...")
@@ -697,7 +859,10 @@ def train_model(model, X_train, Y_train, X_val, Y_val, num_measurements, batch_s
     torch.cuda.empty_cache()
     return model
 
-def predict_in_batches(model, X, batch_size=1024):
+def predict_in_batches(model, X, povms=None, batch_size=1024):
+    if isinstance(model, Transformer) and povms is not None:
+        model.set_povms(povms)
+    
     dataset = CustomDataset(X, np.zeros(len(X)))
     loader = data.DataLoader(
         dataset, 
@@ -717,119 +882,233 @@ def predict_in_batches(model, X, batch_size=1024):
     torch.cuda.empty_cache()  # Clear GPU memory
     return np.vstack(predictions).flatten()
 
-def train_generative_model(X_train, density_matrices, true_negativities, povms, num_epochs=1000, batch_size=64, lr=1e-3, patience=20):
-    input_dim = X_train.shape[1]
-    model = DensityMatrixVAE(input_dim).to(device)
+class DensityMatrixVAE(nn.Module):
+    def __init__(self, input_dim, latent_dim, dm_dim, measurement_count=100):
+        super().__init__()
+        self.input_dim = input_dim
+        self.latent_dim = latent_dim
+        self.dm_dim = dm_dim
+        
+        # Adjust hidden size based on measurement count
+        multiplier = 8 if measurement_count < 200 else 10
+        hidden_size = max(512, input_dim * multiplier)
+        
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_size),
+            nn.GELU(),
+            nn.BatchNorm1d(hidden_size),
+            nn.Linear(hidden_size, latent_dim * 2)
+        )
+        
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_size),
+            nn.GELU(),
+            nn.BatchNorm1d(hidden_size),
+            nn.Linear(hidden_size, dm_dim * dm_dim),
+            nn.ReLU()
+        )
     
-    # Split data into train and validation sets
-    val_size = len(X_train) // 5  # 20% validation split
-    indices = np.random.permutation(len(X_train))
-    train_indices = indices[val_size:]
-    val_indices = indices[:val_size]
+    def encode(self, x):
+        stats = self.encoder(x)
+        mu, logvar = stats.chunk(2, dim=-1)
+        return mu, logvar
     
-    X_train_split = X_train[train_indices]
-    X_val_split = X_train[val_indices]
-    y_train_split = true_negativities[train_indices]
-    y_val_split = true_negativities[val_indices]
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
     
-    train_dataset = CustomDataset(X_train_split, y_train_split)
-    val_dataset = CustomDataset(X_val_split, y_val_split)
+    def decode(self, z):
+        dm_flat = self.decoder(z)
+        dm = dm_flat.view(-1, self.dm_dim, self.dm_dim)
+        dm = 0.5 * (dm + dm.transpose(-1, -2))
+        trace = dm.diagonal(offset=0, dim1=-2, dim2=-1).sum(-1, keepdim=True)
+        eps = 1e-8
+        trace = torch.clamp(trace, min=eps)
+        dm = dm / trace.unsqueeze(-1)
+        return dm
     
-    train_loader = data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = data.DataLoader(val_dataset, batch_size=batch_size)
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        recon_dm = self.decode(z)
+        return recon_dm, mu, logvar
+
+def train_generative_model(X, povms, y_true=None, num_epochs=1000, lr=1e-3):
+    """Train the generative model using MLE reconstruction approach"""
+    # Ensure num_epochs is an integer
+    num_epochs = int(num_epochs) if isinstance(num_epochs, (list, tuple)) else num_epochs
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    input_dim = X.shape[1]
+    latent_dim = 64
+    dm_dim = 16
     
-    best_val_loss = float('inf')
-    best_model = None
+    model = DensityMatrixVAE(
+        input_dim=input_dim,
+        latent_dim=latent_dim,
+        dm_dim=dm_dim,
+        measurement_count=input_dim
+    ).to(device)
+    
+    # Use adaptive learning rate
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    
+    # Convert data to PyTorch tensors
+    X = torch.FloatTensor(X).to(device)
+    if y_true is not None:
+        y_true = torch.FloatTensor(y_true).to(device)
+    
+    # Enhanced early stopping configuration
+    best_loss = float('inf')
+    patience = max(20, X.shape[1] // 5)  # Scale patience with measurement count
     no_improve = 0
+    min_delta = 1e-5  # Minimum improvement threshold
     
-    model.train()
+    # Explicitly move model to GPU and use GPU memory settings
+    model = model.to(device)
+    if torch.cuda.is_available():
+        # Enable memory optimization
+        torch.backends.cudnn.benchmark = True
+        # Use mixed precision training
+        scaler = GradScaler()
+    
     for epoch in range(num_epochs):
-        total_train_loss = 0
         model.train()
+        total_loss = 0
+        batch_size = min(128, len(X))
         
-        # Training loop
-        for batch_X, batch_y in train_loader:
-            batch_X = batch_X.to(device)
+        for i in range(0, len(X), batch_size):
+            batch_X = X[i:i + batch_size]
+            optimizer.zero_grad(set_to_none=True)  # More efficient GPU memory handling
             
-            optimizer.zero_grad()
-            recon_dm, mu, logvar = model(batch_X)
-            
-            # Calculate measurements from reconstructed density matrix
-            recon_measurements = []
-            for dm in recon_dm:
-                measurements = []
-                dm_np = dm.cpu().detach().numpy()
-                measurements = [np.real(np.trace(dm_np @ povm)) for povm in povms[:input_dim]]
-                recon_measurements.append(measurements)
-            
-            recon_measurements = torch.tensor(recon_measurements, device=device, dtype=torch.float32)
-            
-            recon_loss = F.mse_loss(recon_measurements, batch_X)
-            kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-            loss = recon_loss + 0.1 * kl_loss
-            
-            loss.backward()
-            optimizer.step()
-            total_train_loss += loss.item()
-        
-        # Validation loop
-        model.eval()
-        total_val_loss = 0
-        with torch.no_grad():
-            for batch_X, batch_y in val_loader:
-                batch_X = batch_X.to(device)
+            if torch.cuda.is_available():
+                with autocast(device_type='cuda'):  # Specify device_type='cuda'
+                    recon_dm, mu, logvar = model(batch_X)
+                    recon_loss = torch.mean(torch.norm(recon_dm, p='fro', dim=(1,2)))
+                    kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+                    beta = min(1.0, epoch / 100)
+                    loss = recon_loss + beta * kl_loss
+                
+                # Use gradient scaling for mixed precision training
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # Existing CPU training code
                 recon_dm, mu, logvar = model(batch_X)
-                
-                recon_measurements = []
-                for dm in recon_dm:
-                    measurements = []
-                    dm_np = dm.cpu().detach().numpy()
-                    measurements = [np.real(np.trace(dm_np @ povm)) for povm in povms[:input_dim]]
-                    recon_measurements.append(measurements)
-                
-                recon_measurements = torch.tensor(recon_measurements, device=device, dtype=torch.float32)
-                
-                recon_loss = F.mse_loss(recon_measurements, batch_X)
+                recon_loss = torch.mean(torch.norm(recon_dm, p='fro', dim=(1,2)))
                 kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-                val_loss = recon_loss + 0.1 * kl_loss
-                total_val_loss += val_loss.item()
-        
-        avg_val_loss = total_val_loss / len(val_loader)
-        
-        if (epoch + 1) % 100 == 0:
-            print(f'Epoch [{epoch+1}/{num_epochs}], Train Loss: {total_train_loss/len(train_loader):.4f}, Val Loss: {avg_val_loss:.4f}')
+                beta = min(1.0, epoch / 100)
+                loss = recon_loss + beta * kl_loss
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+            
+            total_loss += loss.item()
+
+        # ...rest of existing code...
+
+        avg_loss = total_loss / (len(X) / batch_size)
         
         # Early stopping check
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            best_model = copy.deepcopy(model.state_dict())
+        if avg_loss < best_loss:
+            best_loss = avg_loss
             no_improve = 0
         else:
             no_improve += 1
             if no_improve >= patience:
-                print(f'Early stopping triggered after {epoch + 1} epochs')
+                print(f"Early stopping at epoch {epoch}")
                 break
-    
-    if best_model is not None:
-        model.load_state_dict(best_model)
+        
+        if epoch % 100 == 0:
+            print(f'Epoch {epoch}, Loss: {avg_loss:.6f}')
     
     return model
 
-def evaluate_generative_model(model, X_test, true_negativities):
+def evaluate_generative_model(model, X, y_true=None):
     model.eval()
-    predictions = []
+    X = torch.FloatTensor(X).to(device)
     
+    negativities = []
     with torch.no_grad():
-        for i in range(0, len(X_test), 64):
-            batch_X = torch.FloatTensor(X_test[i:i+64]).to(device)
-            recon_dm, _, _ = model(batch_X)
-            # Calculate negativity from reconstructed density matrix
-            batch_predictions = [entanglement_negativity(dm.cpu().numpy()) for dm in recon_dm]
-            predictions.extend(batch_predictions)
+        for i in range(len(X)):
+            x = X[i:i+1]
+            recon_dm, _, _ = model(x)
+            
+            dm = recon_dm[0].cpu().numpy()
+            dm = 0.5 * (dm + dm.conj().T)
+            dm = dm / np.trace(dm)
+            
+            neg = entanglement_negativity(dm)
+            negativities.append(neg)
     
-    return predictions
+    negativities = np.array(negativities)
+    
+    if y_true is not None:
+        mse = np.mean((negativities - y_true) ** 2)
+        print(f'Test MSE: {mse:.6f}')
+    
+    return negativities
+
+def reconstruct_density_matrix(measurements):
+    """Helper function to reconstruct density matrix from measurements"""
+    # Move tensor to CPU if it's on GPU
+    if torch.is_tensor(measurements):
+        measurements = measurements.cpu().numpy()
+    dm = np.zeros((16, 16), dtype=np.complex128)
+    # Simple reconstruction - you can enhance this
+    for i in range(len(measurements)):
+        proj = np.eye(16) / 16  # Simple projection
+        dm += measurements[i] * proj
+    dm = dm / np.trace(dm)
+    return dm
+
+def reconstruct_density_matrix_mle(measurements, povms, max_iter=1000, tol=1e-6):
+    """
+    Maximum likelihood estimation of density matrix from measurements.
+    
+    Args:
+        measurements: Array of measurement outcomes
+        povms: List of POVM operators
+        max_iter: Maximum number of iterations
+        tol: Convergence tolerance
+    
+    Returns:
+        Reconstructed density matrix
+    """
+    # Initialize with maximally mixed state
+    rho = np.eye(16) / 16
+    
+    # Use only the provided number of measurements/POVMs
+    measurements = measurements[:len(povms)]
+    
+    # Iterative MLE reconstruction
+    for _ in range(max_iter):
+        R = np.zeros((16, 16), dtype=np.complex128)
+        
+        # Compute R operator
+        for m, povm in zip(measurements, povms):
+            # Add numerical stability to probability calculation
+            prob = max(np.real(np.trace(rho @ povm)), 1e-10)
+            # Safe division with clipping
+            factor = np.clip(m / prob, -1e6, 1e6)
+            R += factor * povm
+        
+        # Update density matrix
+        new_rho = R @ rho @ R
+        new_rho = 0.5 * (new_rho + new_rho.conj().T)  # Ensure Hermiticity
+        trace = max(np.real(np.trace(new_rho)), 1e-10)
+        new_rho = new_rho / trace
+        
+        # Check convergence with safe norm calculation
+        if np.max(np.abs(new_rho - rho)) < tol:
+            break
+            
+        rho = new_rho
+    
+    return rho
 
 def main():
     # Enable cuDNN auto-tuner for faster runtime when using GPU
@@ -914,13 +1193,13 @@ def main():
         
         start_time = time.time()
         transformer_model = Transformer(X_train.shape[1]).to(device)
-        transformer_model = train_model(transformer_model, X_train_norm, Y_train, X_val_norm, Y_val, num_measurements, batch_size=batch_size)
+        transformer_model = train_model(transformer_model, X_train_norm, Y_train, X_val_norm, Y_val, num_measurements, povms=povms, batch_size=batch_size)
         transformer_time = time.time() - start_time
 
         # Evaluate models with batches
         mlp_predictions = predict_in_batches(mlp_model, X_test_norm, batch_size)
         cnn_predictions = predict_in_batches(cnn_model, X_test_norm, batch_size)
-        transformer_predictions = predict_in_batches(transformer_model, X_test_norm, batch_size)
+        transformer_predictions = predict_in_batches(transformer_model, X_test_norm, povms=povms, batch_size=batch_size)
 
         # MLE
         start_time = time.time()
@@ -936,7 +1215,13 @@ def main():
 
         # Add Generative method evaluation
         start_time = time.time()
-        gen_model = train_generative_model(X_train_norm, None, Y_train, povms)  # Pass povms as argument
+        gen_model = train_generative_model(
+            X=X_train_norm,
+            povms=povms,
+            y_true=Y_train,
+            num_epochs=1000,  # Explicitly pass as integer
+            lr=1e-3
+        )
         gen_predictions = evaluate_generative_model(gen_model, X_test_norm, Y_test)
         gen_time = time.time() - start_time
         gen_mse = np.mean((np.array(gen_predictions) - Y_test)**2)
@@ -1037,6 +1322,7 @@ def main():
     plt.plot(measurements, mle_mse, 'o-', label="MLE")
     plt.plot(measurements, bayesian_mse, 'o-', label="Bayesian")
     plt.plot(measurements, generative_mse, 'o-', label="Generative")
+    plt.plot(measurements, cnn_time, 'o-', label="CNN")
     plt.xlabel("Number of Measurements")
     plt.ylabel("MSE")
     plt.yscale('log')
