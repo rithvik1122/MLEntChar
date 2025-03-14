@@ -835,77 +835,6 @@ class CustomLoss(nn.Module):
         # Combined loss that naturally benefits from more measurements
         return mse + 0.01 * rel_error + 0.05 * l1_loss
 
-def custom_density_matrix_loss(pred_dm, target_negativity, povms=None):
-    """
-    Custom loss function for density matrix prediction that enforces physical constraints
-    and optimizes for matching the expected negativity.
-    
-    Args:
-        pred_dm: Predicted density matrix tensor, shape [batch_size, 16, 16]
-        target_negativity: Target negativity values, shape [batch_size, 1]
-        povms: List of POVM operators for measurement reconstruction loss
-        
-    Returns:
-        Loss tensor combining negativity loss and physical constraints
-    """
-    batch_size = pred_dm.size(0)
-    device = pred_dm.device
-    
-    # Ensure Hermitian
-    pred_dm = 0.5 * (pred_dm + pred_dm.transpose(1, 2).conj())
-    
-    # Get batch of negativity values (CPU computation for stability)
-    pred_negativity = []
-    for i in range(min(batch_size, 32)):  # Process only first 32 to avoid OOM
-        # Move single matrix to CPU for stability
-        dm_np = pred_dm[i].detach().cpu().numpy()
-        try:
-            neg = entanglement_negativity(dm_np)
-        except:
-            neg = 0.0
-        pred_negativity.append(neg)
-    
-    # Convert back to tensor
-    pred_negativity = torch.tensor(pred_negativity, device=device).view(-1, 1)
-    
-    # Compute negativity loss using only processed matrices
-    if len(pred_negativity) > 0:
-        target_subset = target_negativity[:len(pred_negativity)]
-        neg_loss = F.mse_loss(pred_negativity.float(), target_subset.float())
-    else:
-        neg_loss = torch.tensor(0.0, device=device)
-    
-    # Physical constraints
-    trace_loss = torch.mean(torch.abs(
-        torch.diagonal(pred_dm, dim1=1, dim2=2).sum(dim=1) - 1.0
-    ))
-    
-    # Simplified PSD constraint (expensive full eigendecomposition avoided)
-    psd_loss = torch.tensor(0.0, device=device)
-    for i in range(min(batch_size, 8)):  # Check only few matrices
-        # Get random 2x2 submatrices and check if they have non-negative determinant
-        for _ in range(5):  # Sample a few submatrices
-            idx = torch.randint(0, 16, (2,), device=device)
-            submatrix = pred_dm[i, idx][:, idx]
-            det = submatrix[0, 0] * submatrix[1, 1] - submatrix[0, 1] * submatrix[1, 0]
-            psd_loss = psd_loss + torch.relu(-det.real)
-    
-    # Measurement reproduction loss if POVMs provided
-    meas_loss = torch.tensor(0.0, device=device)
-    if povms is not None and len(povms) > 0:
-        # Use limited number of POVMs for efficiency
-        num_povms = min(len(povms), 20)
-        for i in range(num_povms):
-            povm = torch.tensor(povms[i], dtype=torch.complex64, device=device)
-            pred_prob = torch.abs(torch.diagonal(pred_dm @ povm, dim1=1, dim2=2).sum(dim=1))
-            # Target values are 0.0 to 1.0 since we don't have actual measurements
-            # This just enforces that probabilities are reasonable
-            meas_loss = meas_loss + torch.mean(torch.relu(pred_prob - 1.0) + torch.relu(-pred_prob))
-    
-    # Combine losses with appropriate weights
-    total_loss = neg_loss + 0.1 * trace_loss + 0.1 * psd_loss + 0.05 * meas_loss
-    return total_loss.float()
-
 def train_model(model, X_train, Y_train, X_val, Y_val, num_measurements, povms=None, batch_size=256, patience=50, max_epochs=2000):
     # Dynamic batch size adjustment to prevent OOM errors
     if isinstance(model, Transformer):
@@ -1330,360 +1259,6 @@ def predict_in_batches(model, X, povms=None, batch_size=128):  # Reduced default
     
     return result
 
-class DensityMatrixVAE(nn.Module):
-    def __init__(self, input_dim, latent_dim, dm_dim, measurement_count=100):
-        super().__init__()
-        self.input_dim = input_dim
-        self.latent_dim = latent_dim
-        self.dm_dim = dm_dim
-        
-        # Adjust hidden size based on measurement count
-        multiplier = 8 if measurement_count < 200 else 10
-        hidden_size = max(512, input_dim * multiplier)
-        
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_size),
-            nn.GELU(),
-            nn.BatchNorm1d(hidden_size),
-            nn.Linear(hidden_size, latent_dim * 2)
-        )
-        
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, hidden_size),
-            nn.GELU(),
-            nn.BatchNorm1d(hidden_size),
-            nn.Linear(hidden_size, dm_dim * dm_dim),
-            nn.ReLU()
-        )
-    
-    def encode(self, x):
-        stats = self.encoder(x)
-        mu, logvar = stats.chunk(2, dim=-1)
-        return mu, logvar
-    
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-    
-    def decode(self, z):
-        dm_flat = self.decoder(z)
-        dm = dm_flat.view(-1, self.dm_dim, self.dm_dim)
-        dm = 0.5 * (dm + dm.transpose(-1, -2))
-        trace = dm.diagonal(offset=0, dim1=-2, dim2=-1).sum(-1, keepdim=True)
-        eps = 1e-8
-        trace = torch.clamp(trace, min=eps)
-        dm = dm / trace.unsqueeze(-1)
-        return dm
-    
-    def forward(self, x):
-        mu, logvar = self.encode(x)
-        z = self.reparameterize(mu, logvar)
-        recon_dm = self.decode(z)
-        return recon_dm, mu, logvar
-
-def train_generative_model(X, povms, y_true=None, num_epochs=1000, lr=1e-3, num_measurements=None):
-    """Improved generative model training that scales with measurement count"""
-    # Convert num_measurements to integer if it's a tensor/array
-    if num_measurements is None:
-        # Default to input dimension
-        num_measurements = X.shape[1]
-    
-    # Ensure num_epochs is an integer
-    num_epochs = int(num_epochs) if isinstance(num_epochs, (list, tuple)) else num_epochs
-    
-    input_dim = X.shape[1]
-    # Scale latent dim with measurement count for better representation
-    latent_dim = min(256, max(64, input_dim * 3 // 2))
-    dm_dim = 16
-    
-    # Create an enhanced VAE model with measurement-dependent architecture
-    class EnhancedDensityMatrixVAE(nn.Module):
-        def __init__(self, input_dim, latent_dim, dm_dim):
-            super().__init__()
-            self.input_dim = input_dim
-            self.latent_dim = latent_dim
-            self.dm_dim = dm_dim
-            
-            # Scale network based on input size
-            hidden_factors = [2, 4, 6, 8]
-            hidden_dims = [min(4096, input_dim * factor) for factor in hidden_factors]
-            
-            # Enhanced encoder with measurement-aware architecture
-            self.encoder = nn.Sequential(
-                nn.Linear(input_dim, hidden_dims[0]),
-                nn.BatchNorm1d(hidden_dims[0]),
-                nn.GELU(),
-                nn.Linear(hidden_dims[0], hidden_dims[1]),
-                nn.BatchNorm1d(hidden_dims[1]),
-                nn.GELU(),
-                nn.Linear(hidden_dims[1], hidden_dims[2]),
-                nn.BatchNorm1d(hidden_dims[2]),
-                nn.GELU(),
-                nn.Linear(hidden_dims[2], latent_dim * 2)
-            )
-            
-            # Enhanced decoder with better density matrix generation
-            self.decoder = nn.Sequential(
-                nn.Linear(latent_dim, hidden_dims[2]),
-                nn.BatchNorm1d(hidden_dims[2]),
-                nn.GELU(),
-                nn.Linear(hidden_dims[2], hidden_dims[1]),
-                nn.BatchNorm1d(hidden_dims[1]),
-                nn.GELU(),
-                nn.Linear(hidden_dims[1], hidden_dims[0]),
-                nn.BatchNorm1d(hidden_dims[0]),
-                nn.GELU(),
-                nn.Linear(hidden_dims[0], dm_dim * dm_dim * 2)  # Real and imaginary parts
-            )
-            
-            # Initialize with measurement-aware scaling
-            self._initialize_weights(input_dim)
-        
-        def _initialize_weights(self, input_dim):
-            """Better weight initialization that scales with input size"""
-            for m in self.modules():
-                if isinstance(m, nn.Linear):
-                    # Use Xavier uniform with gain that decreases with more measurements
-                    gain = min(1.0, max(0.01, 0.1 + 10.0/input_dim))
-                    nn.init.xavier_uniform_(m.weight, gain=gain)
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
-                elif isinstance(m, nn.BatchNorm1d):
-                    nn.init.constant_(m.weight, 1)
-                    nn.init.constant_(m.bias, 0)
-        
-        def encode(self, x):
-            stats = self.encoder(x)
-            mu, logvar = stats.chunk(2, dim=-1)
-            return mu, logvar
-        
-        def reparameterize(self, mu, logvar):
-            std = torch.exp(0.5 * torch.clamp(logvar, -10, 2))  # Clamped for stability
-            eps = torch.randn_like(std)
-            return mu + eps * std
-        
-        def decode(self, z):
-            outputs = self.decoder(z)
-            real, imag = outputs.chunk(2, dim=-1)
-            
-            # Reshape to matrix
-            real = real.view(-1, self.dm_dim, self.dm_dim)
-            imag = imag.view(-1, self.dm_dim, self.dm_dim)
-            
-            # Create complex matrix
-            dm = torch.complex(real, imag)
-            
-            # Ensure Hermitian
-            dm = 0.5 * (dm + dm.transpose(1, 2).conj())
-            
-            # Ensure trace 1 and positive semi-definite
-            try:
-                # Safer eigendecomposition with clipping
-                eigenvals, eigenvecs = torch.linalg.eigh(dm)
-                eigenvals = F.softplus(eigenvals)  # Ensure positive
-                
-                # Reconstruct with PSD constraint
-                dm = eigenvecs @ torch.diag_embed(eigenvals) @ eigenvecs.transpose(1, 2).conj()
-                
-                # Normalize trace
-                trace = torch.diagonal(dm, dim1=1, dim2=2).sum(dim=1, keepdim=True).unsqueeze(-1)
-                dm = dm / trace
-                
-            except RuntimeError:
-                # Fallback normalization if eigendecomposition fails
-                trace = torch.diagonal(dm, dim1=1, dim2=2).sum(dim=1, keepdim=True).unsqueeze(-1)
-                dm = dm / (trace.abs() + 1e-6)
-            
-            return dm
-        
-        def forward(self, x):
-            mu, logvar = self.encode(x)
-            z = self.reparameterize(mu, logvar)
-            dm = self.decode(z)
-            return dm, mu, logvar
-    
-    # Create model with measurement-dependent architecture
-    model = EnhancedDensityMatrixVAE(
-        input_dim=input_dim,
-        latent_dim=latent_dim,
-        dm_dim=dm_dim
-    ).to(device)
-    
-    # Learning rate scales with measurements for better convergence
-    lr_scale = 1.0 / np.sqrt(num_measurements)
-    base_lr = min(2e-3, max(5e-4, lr * lr_scale))
-    
-    # Weight decay increases with measurements to prevent overfitting
-    wd_scale = min(1e-4 * np.sqrt(num_measurements), 1e-3)
-    
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=base_lr,
-        weight_decay=wd_scale,
-        betas=(0.9, 0.999),
-        eps=1e-8
-    )
-    
-    # Replace OneCycleLR with standard StepLR or CosineAnnealingLR
-    # OneCycleLR is not available in older PyTorch versions
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=num_epochs,
-        eta_min=base_lr / 10
-    )
-    
-    # Convert data to PyTorch tensors
-    X = torch.FloatTensor(X).to(device)
-    if y_true is not None:
-        y_true = torch.FloatTensor(y_true).to(device)
-    
-    # Scale batch size with measurement count
-    base_batch_size = 64
-    batch_size = min(256, max(32, base_batch_size * 100 // num_measurements))
-    
-    # Early stopping with measurement-dependent patience
-    patience = max(20, min(50, num_measurements // 5))
-    best_loss = float('inf')
-    no_improve = 0
-    best_state_dict = None
-    
-    # Create scaler for mixed precision
-    scaler = GradScaler(enabled=torch.cuda.is_available())
-    
-    # Enhanced training loop with physical constraints
-    for epoch in range(num_epochs):
-        model.train()
-        total_loss = 0.0
-        num_batches = 0
-        
-        # Adaptive KL weight that decreases with more measurements
-        # This allows more accurate reconstructions with more information
-        kl_weight = min(1.0, max(0.01, 0.2 / np.sqrt(num_measurements)))
-        kl_weight *= min(1.0, epoch / (0.1 * num_epochs))  # Annealing
-        
-        for i in range(0, len(X), batch_size):
-            batch_X = X[i:i + batch_size]
-            optimizer.zero_grad(set_to_none=True)
-            
-            if torch.cuda.is_available():
-                # Fix: Add device_type parameter to autocast
-                with autocast(device_type='cuda'):
-                    dm_pred, mu, logvar = model(batch_X)
-                    
-                    # Physical constraints loss with measurement-aware weighting
-                    recon_loss = torch.mean(torch.norm(dm_pred, p='fro', dim=(1,2)))
-                    
-                    # KL divergence with adaptive weight
-                    kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-                    
-                    # Total loss with measurement-dependent weighting
-                    loss = recon_loss + kl_weight * kl_loss
-                
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                dm_pred, mu, logvar = model(batch_X)
-                recon_loss = torch.mean(torch.norm(dm_pred, p='fro', dim=(1,2)))
-                kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-                loss = recon_loss + kl_weight * kl_loss
-                
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-            
-            total_loss += loss.item()
-            num_batches += 1
-        
-        # Update learning rate
-        scheduler.step()
-        
-        # Check for improvement
-        avg_loss = total_loss / num_batches
-        if avg_loss < best_loss - 1e-4:
-            best_loss = avg_loss
-            best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            no_improve = 0
-        else:
-            no_improve += 1
-        
-        # Early stopping
-        if no_improve >= patience:
-            print(f"Early stopping at epoch {epoch}")
-            break
-        
-        # Print progress
-        if epoch % 100 == 0:
-            lr = optimizer.param_groups[0]['lr']
-            print(f'Epoch {epoch}, Loss: {avg_loss:.6f}, LR: {lr:.6f}, KL weight: {kl_weight:.4f}')
-    
-    # Load best model
-    if best_state_dict:
-        model.load_state_dict({k: v.to(device) for k, v in best_state_dict.items()})
-    
-    return model
-
-def evaluate_generative_model(model, X, y_true=None):
-    """Improved evaluation with better negativity calculation"""
-    model.eval()
-    X = torch.FloatTensor(X).to(device)
-    batch_size = min(64, len(X))
-    
-    negativities = []
-    with torch.no_grad():
-        for i in range(0, len(X), batch_size):
-            batch_X = X[i:i+batch_size]
-            density_matrices, _, _ = model(batch_X)
-            
-            # Process each density matrix more carefully
-            for j in range(density_matrices.shape[0]):
-                # Get single density matrix and ensure it's physical
-                dm = density_matrices[j].cpu().numpy()
-                
-                # Ensure Hermitian (redundant but safe)
-                dm = 0.5 * (dm + dm.conj().T)
-                
-                # Project to positive semidefinite
-                eigenvals, eigenvecs = np.linalg.eigh(dm)
-                eigenvals = np.maximum(eigenvals.real, 0)  # Ensure PSD
-                dm = eigenvecs @ np.diag(eigenvals) @ eigenvecs.conj().T
-                
-                # Normalize trace
-                trace = np.trace(dm).real
-                if trace > 1e-10:
-                    dm = dm / trace
-                else:
-                    # Fallback to maximally mixed state if trace is too small
-                    dm = np.eye(16) / 16
-                
-                # Calculate negativity with more robust implementation
-                try:
-                    neg = entanglement_negativity(dm)
-                    negativities.append(neg)
-                except np.linalg.LinAlgError:
-                    # Fallback for numerical stability issues
-                    negativities.append(0.0)
-    
-    negativities = np.array(negativities)
-    
-    # Trim to match input length if necessary
-    if len(negativities) > len(X):
-        negativities = negativities[:len(X)]
-        
-    # Calculate error metrics if ground truth is available
-    if y_true is not None:
-        if torch.is_tensor(y_true):
-            y_true = y_true.cpu().numpy()
-        
-        mse = np.mean((negativities - y_true) ** 2)
-        mae = np.mean(np.abs(negativities - y_true))
-        print(f'Generative Model - Test MSE: {mse:.6f}, MAE: {mae:.6f}')
-    
-    return negativities
-
 def reconstruct_density_matrix(measurements):
     """Helper function to reconstruct density matrix from measurements"""
     # Move tensor to CPU if it's on GPU
@@ -1880,7 +1455,7 @@ def main():
     
     # Create tracking dictionaries
     all_metrics = {method: {'mse': [], 'rel_error': []} 
-                  for method in ['MLP', 'CNN', 'Transformer', 'MLE', 'Bayesian', 'Generative']}
+                  for method in ['MLP', 'CNN', 'Transformer', 'MLE', 'Bayesian']}  # Removed 'Generative'
 
     # Create models directory if saving models
     if args.save_models:
@@ -1991,38 +1566,7 @@ def main():
                 bayesian_time = time.time() - start_time
                 bayesian_mse = np.mean((np.array(bayesian_predictions) - Y_test)**2)
     
-                # Add Generative method evaluation
-                start_time = time.time()
-                gen_model = train_generative_model(
-                    X=X_train_norm,
-                    povms=povms,
-                    y_true=Y_train,
-                    num_epochs=1000,
-                    lr=1e-3,
-                    num_measurements=num_measurements
-                )
-                gen_predictions = evaluate_generative_model(gen_model, X_test_norm, Y_test)
-                gen_time = time.time() - start_time
-                gen_mse = np.mean((np.array(gen_predictions) - Y_test)**2)
-                
-                # Save Generative model if requested
-                if args.save_models:
-                    model_path = f'saved_models/generative_model_{num_measurements}.pt'
-                    torch.save(gen_model.state_dict(), model_path)
-                    print(f"Generative model saved to {model_path}")
-                
-                # Also save normalization parameters for future use
-                if args.save_models:
-                    norm_params = {
-                        'mean': np.mean(X_train, axis=0),
-                        'std': np.std(X_train, axis=0),
-                        'input_dim': X_train.shape[1],
-                        'povms': povms[:num_measurements] if num_measurements <= len(povms) else povms
-                    }
-                    np.savez(f'saved_models/norm_params_{num_measurements}.npz', **norm_params)
-                    print(f"Normalization parameters saved for {num_measurements} measurements")
-    
-                # Store results
+                # Store results - remove Generative
                 results.append({
                     "num_measurements": num_measurements,
                     "MLP_MSE": np.mean((mlp_predictions.flatten() - Y_test)**2),
@@ -2030,13 +1574,11 @@ def main():
                     "Transformer_MSE": np.mean((transformer_predictions.flatten() - Y_test)**2),
                     "MLE_MSE": mle_mse,
                     "Bayesian_MSE": bayesian_mse,
-                    "Generative_MSE": gen_mse,
                     "MLP_Time": mlp_time,
                     "CNN_Time": cnn_time,
                     "Transformer_Time": transformer_time,
                     "MLE_Time": mle_time,
                     "Bayesian_Time": bayesian_time,
-                    "Generative_Time": gen_time,
                     "valid_states": len(Y),
                     "requested_states": sim_size
                 })
@@ -2044,8 +1586,8 @@ def main():
                 # Save data as we go to prevent data loss
                 with open(f'entanglement_results_{num_measurements}.csv', 'w', newline='') as file:
                     fieldnames = ["num_measurements", "MLP_MSE", "CNN_MSE", "Transformer_MSE", "MLE_MSE", 
-                                  "Bayesian_MSE", "Generative_MSE", "MLP_Time", "CNN_Time", "Transformer_Time", 
-                                  "MLE_Time", "Bayesian_Time", "Generative_Time", "valid_states", "requested_states"]
+                                  "Bayesian_MSE", "MLP_Time", "CNN_Time", "Transformer_Time", 
+                                  "MLE_Time", "Bayesian_Time", "valid_states", "requested_states"]
                     writer = csv.DictWriter(file, fieldnames=fieldnames)
                     writer.writeheader()
                     writer.writerow(results[-1])
@@ -2072,8 +1614,8 @@ def main():
             # Write results with rounded values for clarity
             with open('entanglement_results.csv', 'w', newline='') as file:
                 fieldnames = ["num_measurements", "MLP_MSE", "CNN_MSE", "Transformer_MSE", "MLE_MSE", 
-                             "Bayesian_MSE", "Generative_MSE", "MLP_Time", "CNN_Time", "Transformer_Time", 
-                             "MLE_Time", "Bayesian_Time", "Generative_Time", "valid_states", "requested_states"]
+                             "Bayesian_MSE", "MLP_Time", "CNN_Time", "Transformer_Time", 
+                             "MLE_Time", "Bayesian_Time", "valid_states", "requested_states"]
                 writer = csv.DictWriter(file, fieldnames=fieldnames)
                 writer.writeheader()
                 for row in results:

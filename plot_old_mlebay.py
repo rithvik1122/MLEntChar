@@ -107,14 +107,16 @@ def create_plots(results_path='entanglement_results.csv', predictions_path='pred
                     predictions_df[col] = predictions_df[col].apply(parse_complex)
         
         # Define methods and their properties for consistent styling
-        methods = ['MLP', 'CNN', 'Transformer', 'MLE', 'Bayesian', 'Generative']
+        # Commenting out Generative model as it's not performing well
+        # methods = ['MLP', 'CNN', 'Transformer', 'MLE', 'Bayesian', 'Generative']
+        methods = ['MLP', 'CNN', 'Transformer', 'MLE', 'Bayesian']
         nice_names = {
             'MLP': 'Multi-Layer Perceptron',
             'CNN': 'Convolutional Neural Network',
             'Transformer': 'Transformer Network',
             'MLE': 'Maximum Likelihood',
             'Bayesian': 'Bayesian Estimation',
-            'Generative': 'Generative Model'
+            # 'Generative': 'Generative Model'  # Commented out
         }
         colors = {
             'MLP': '#1f77b4',      # Blue
@@ -122,7 +124,7 @@ def create_plots(results_path='entanglement_results.csv', predictions_path='pred
             'Transformer': '#2ca02c', # Green
             'MLE': '#d62728',      # Red
             'Bayesian': '#9467bd', # Purple
-            'Generative': '#8c564b' # Brown
+            # 'Generative': '#8c564b' # Brown  # Commented out
         }
         markers = {
             'MLP': 'o', 
@@ -130,7 +132,7 @@ def create_plots(results_path='entanglement_results.csv', predictions_path='pred
             'Transformer': '^', 
             'MLE': 'D', 
             'Bayesian': 'P', 
-            'Generative': 'X'
+            # 'Generative': 'X'  # Commented out
         }
         
         # Calculate overall statistics
@@ -235,6 +237,160 @@ def create_plots(results_path='entanglement_results.csv', predictions_path='pred
         plt.tight_layout()
         plt.savefig(plots_dir / 'mse_vs_measurements.png', dpi=300)
         plt.savefig(plots_dir / 'mse_vs_measurements.pdf')
+        
+        # NEW PLOT: Computation Time vs Number of Measurements (Publication Quality)
+        print("\nCreating Computation Time vs Measurements plot...")
+        plt.figure(figsize=(10, 8))
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        for method in methods:
+            # Create scatter plot with connecting lines
+            ax.plot(
+                results_df['num_measurements'], 
+                results_df[f'{method}_Time'],
+                marker=markers[method],
+                linestyle='-',
+                label=nice_names[method],
+                color=colors[method],
+                linewidth=2,
+                markersize=9,
+                markeredgecolor='white',
+                markeredgewidth=1.5,
+                alpha=0.9
+            )
+        
+        # Set log scales for both axes
+        ax.set_xscale('log', base=10)
+        ax.set_yscale('log', base=10)
+        
+        # Add grid with enhanced appearance
+        ax.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.6)
+        
+        # Add labels and title
+        ax.set_xlabel('Number of Measurements (N)', fontsize=15, fontweight='bold')
+        ax.set_ylabel('Computation Time (seconds)', fontsize=15, fontweight='bold')
+        ax.set_title('Computation Time vs Measurement Count', 
+                    fontsize=16, fontweight='bold')
+        
+        # Add legend with enhanced appearance
+        legend = ax.legend(
+            loc='upper left',
+            frameon=True,
+            framealpha=0.95,
+            edgecolor='gray',
+            fancybox=True,
+            shadow=True,
+            ncol=2
+        )
+        
+        # Improve tick formatting
+        ax.xaxis.set_major_formatter(mtick.ScalarFormatter())
+        ax.xaxis.set_tick_params(which='minor', bottom=False)
+        
+        # Add shaded regions for error bars if multiple runs exist
+        methods_with_multiple_runs = []
+        for method in methods:
+            if len(results_df.groupby('num_measurements')[f'{method}_Time']) > 1:
+                methods_with_multiple_runs.append(method)
+                
+        if methods_with_multiple_runs:
+            for method in methods_with_multiple_runs:
+                grouped = results_df.groupby('num_measurements')[f'{method}_Time']
+                means = grouped.mean()
+                stds = grouped.std()
+                ax.fill_between(
+                    means.index, 
+                    means - stds, 
+                    means + stds, 
+                    alpha=0.2, 
+                    color=colors[method]
+                )
+        
+        # Save the figure
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'time_vs_measurements.png', dpi=300)
+        plt.savefig(plots_dir / 'time_vs_measurements.pdf')
+        
+        # FIX: Create separate figure for time vs measurements with complexity visualization
+        print("Creating Time vs Measurements with complexity reference...")
+        fig_complexity, ax_complexity = plt.subplots(figsize=(10, 8))
+        
+        # Re-plot each method on the new figure
+        for method in methods:
+            ax_complexity.plot(
+                results_df['num_measurements'], 
+                results_df[f'{method}_Time'],
+                marker=markers[method],
+                linestyle='-',
+                label=nice_names[method],
+                color=colors[method],
+                linewidth=2,
+                markersize=9,
+                markeredgecolor='white',
+                markeredgewidth=1.5,
+                alpha=0.9
+            )
+        
+        # Set log scales for both axes
+        ax_complexity.set_xscale('log', base=10)
+        ax_complexity.set_yscale('log', base=10)
+        
+        # Add grid with enhanced appearance
+        ax_complexity.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.6)
+        
+        # Add reference lines showing expected scaling
+        x_vals = np.logspace(np.log10(results_df['num_measurements'].min()),
+                           np.log10(results_df['num_measurements'].max()), 100)
+        
+        # For the computational complexity visualization
+        min_m = results_df['num_measurements'].min()
+        
+        # Find a reference point for MLE/Bayesian method to show O(N) and O(N²) scaling
+        if 'MLE' in methods:
+            mle_times = results_df[results_df['num_measurements'] == min_m]['MLE_Time'].values
+            if len(mle_times) > 0:
+                ref_time = mle_times[0]
+                
+                # Add O(N) and O(N²) reference lines
+                ax_complexity.plot(x_vals, ref_time * (x_vals/min_m), 'k--', linewidth=1.5, alpha=0.7, label='O(N) scaling')
+                ax_complexity.plot(x_vals, ref_time * (x_vals/min_m)**2, 'k:', linewidth=1.5, alpha=0.7, label='O(N²) scaling')
+                
+                # Add text annotations for clarity
+                mid_x = np.sqrt(min_m * results_df['num_measurements'].max())
+                y_pos_linear = ref_time * (mid_x/min_m) * 0.7
+                y_pos_quadratic = ref_time * (mid_x/min_m)**2 * 0.7
+                
+                ax_complexity.annotate('O(N)', xy=(mid_x, y_pos_linear),
+                                     xycoords='data', fontsize=12, alpha=0.8,
+                                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8))
+                                     
+                ax_complexity.annotate('O(N²)', xy=(mid_x, y_pos_quadratic),
+                                     xycoords='data', fontsize=12, alpha=0.8,
+                                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8))
+        
+        # Add labels and title
+        ax_complexity.set_xlabel('Number of Measurements (N)', fontsize=15, fontweight='bold')
+        ax_complexity.set_ylabel('Computation Time (seconds)', fontsize=15, fontweight='bold')
+        ax_complexity.set_title('Computation Time vs Measurements with Complexity References', 
+                             fontsize=16, fontweight='bold')
+        
+        # Add legend with enhanced appearance
+        legend = ax_complexity.legend(
+            loc='upper left',
+            frameon=True,
+            framealpha=0.95,
+            edgecolor='gray',
+            fancybox=True,
+            shadow=True
+        )
+        
+        # Improve tick formatting
+        ax_complexity.xaxis.set_major_formatter(mtick.ScalarFormatter())
+        ax_complexity.xaxis.set_tick_params(which='minor', bottom=False)
+                
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'time_vs_measurements_with_complexity.png', dpi=300)
+        plt.savefig(plots_dir / 'time_vs_measurements_with_complexity.pdf')
         
         # PLOT 2: Enhanced MSE Comparison with error bars
         print("Creating enhanced MSE comparison plot...")
@@ -427,7 +583,7 @@ def create_plots(results_path='entanglement_results.csv', predictions_path='pred
                 ax.plot([min_val, max_val], [min_val, max_val], 'k--', 
                        label='Perfect Prediction', linewidth=1.5, alpha=0.7)
                 
-                # Plot subset of methods to avoid overcrowding
+                # Plot subset of methods to avoid overcrowding - remove Generative
                 plot_methods = ['MLP', 'CNN', 'Transformer', 'Bayesian']
                 
                 for method in plot_methods:

@@ -125,7 +125,7 @@ def create_test_data(num_measurements, num_samples=100, model_dir="saved_models"
     return X_test
 
 def benchmark_models(measurements_list, test_samples=500, batch_size=64, model_dir="saved_models", 
-                     models_to_test=None, include_traditional=True, plot_dir="comparison_plots"):
+                     models_to_test=None, include_traditional=True, output_dir="prediction_outputs"):
     """
     Benchmark models across different measurement counts against MLE and Bayesian methods
     
@@ -136,10 +136,20 @@ def benchmark_models(measurements_list, test_samples=500, batch_size=64, model_d
         model_dir: Directory where models are stored
         models_to_test: List of model types to test ('mlp', 'cnn', 'transformer', 'generative')
         include_traditional: Whether to include MLE and Bayesian methods
-        plot_dir: Directory to save comparison plots
+        output_dir: Base directory to save all outputs
     """
-    # Create plots directory if it doesn't exist
+    # Create output directories
+    os.makedirs(output_dir, exist_ok=True)
+    plot_dir = os.path.join(output_dir, "comparison_plots")
     os.makedirs(plot_dir, exist_ok=True)
+    
+    # Create data directory for CSV files
+    data_dir = os.path.join(output_dir, "benchmark_data")
+    os.makedirs(data_dir, exist_ok=True)
+    
+    print(f"Outputs will be saved to '{output_dir}' directory")
+    print(f"Plots will be saved to '{plot_dir}' directory")
+    print(f"Data files will be saved to '{data_dir}' directory")
     
     # Default to all models if none specified
     if models_to_test is None:
@@ -261,7 +271,7 @@ def benchmark_models(measurements_list, test_samples=500, batch_size=64, model_d
     df = pd.DataFrame(results)
     
     # Save results to CSV
-    results_file = os.path.join(plot_dir, 'benchmark_results.csv')
+    results_file = os.path.join(data_dir, 'benchmark_results.csv')
     df.to_csv(results_file, index=False)
     print(f"\nResults saved to {results_file}")
     
@@ -388,6 +398,33 @@ def benchmark_models(measurements_list, test_samples=500, batch_size=64, model_d
     plt.savefig(efficiency_plot_file, dpi=300)
     print(f"Efficiency frontier plot saved to {efficiency_plot_file}")
     
+    # Save raw data for each measurement count
+    for num_measurements in measurements_list:
+        measurements_data = {}
+        measurements_data['true_values'] = y_true
+        
+        for method in df['method'].unique():
+            method_data = df[(df['method'] == method) & (df['measurements'] == num_measurements)]
+            if not method_data.empty:
+                # Find the corresponding predictions and save them
+                if method == 'mlp' and 'mlp_predictions' in locals():
+                    measurements_data['mlp'] = mlp_predictions
+                elif method == 'cnn' and 'cnn_predictions' in locals():
+                    measurements_data['cnn'] = cnn_predictions
+                elif method == 'transformer' and 'transformer_predictions' in locals():
+                    measurements_data['transformer'] = transformer_predictions
+                elif method == 'generative' and 'generative_predictions' in locals():
+                    measurements_data['generative'] = generative_predictions
+                elif method == 'mle' and 'mle_predictions' in locals():
+                    measurements_data['mle'] = mle_predictions
+                elif method == 'bayesian' and 'bayesian_predictions' in locals():
+                    measurements_data['bayesian'] = bayesian_predictions
+        
+        # Save measurements data to file
+        measurements_file = os.path.join(data_dir, f'predictions_{num_measurements}.npz')
+        np.savez(measurements_file, **measurements_data)
+        print(f"Raw prediction data for {num_measurements} measurements saved to {measurements_file}")
+    
     return df
 
 def main():
@@ -403,8 +440,8 @@ def main():
                         help='Number of samples to generate if no data file is provided')
     parser.add_argument('--batch-size', type=int, default=64,
                         help='Batch size for predictions')
-    parser.add_argument('--output', type=str, default='predictions.npz',
-                        help='Output file for predictions')
+    parser.add_argument('--output-dir', type=str, default='prediction_outputs',
+                        help='Directory to save all outputs')
     parser.add_argument('--compare', action='store_true',
                         help='Run comparison benchmarks against MLE and Bayesian methods')
     parser.add_argument('--no-traditional', action='store_true',
@@ -413,6 +450,17 @@ def main():
                         help='Number of samples for benchmarking (only used with --compare)')
     
     args = parser.parse_args()
+    
+    # Create output directory if it doesn't exist
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"All outputs will be saved to '{output_dir}' directory")
+    
+    # Create subdirectories for different output types
+    plots_dir = os.path.join(output_dir, 'plots')
+    data_dir = os.path.join(output_dir, 'data')
+    os.makedirs(plots_dir, exist_ok=True)
+    os.makedirs(data_dir, exist_ok=True)
     
     # Check if model directory exists
     model_dir = "saved_models"
@@ -451,14 +499,15 @@ def main():
         else:
             measurements_list = [args.measurements]
         
-        # Run benchmarks
+        # Run benchmarks with output directory
         benchmark_models(
             measurements_list=measurements_list,
             test_samples=args.benchmark_samples,
             batch_size=args.batch_size,
             model_dir=model_dir,
             models_to_test=models_to_test,
-            include_traditional=not args.no_traditional
+            include_traditional=not args.no_traditional,
+            output_dir=output_dir
         )
         
         return 0
@@ -524,11 +573,12 @@ def main():
         except Exception as e:
             print(f"Error with {model_type} model: {e}")
     
-    # Save all predictions
-    np.savez(args.output, **all_predictions)
-    print(f"\nAll predictions saved to {args.output}")
+    # Store all predictions in output directory
+    output_file = os.path.join(data_dir, f'predictions_{args.measurements}.npz')
+    np.savez(output_file, **all_predictions)
+    print(f"\nAll predictions saved to {output_file}")
     
-    # Plot histogram of predictions
+    # Plot histogram of predictions and save to plots directory
     plt.figure(figsize=(12, 8))
     for model_type, preds in all_predictions.items():
         plt.hist(preds, alpha=0.5, bins=30, label=model_type)
@@ -539,10 +589,26 @@ def main():
     plt.legend()
     plt.grid(alpha=0.3)
     
-    # Save plot
-    plot_file = f"predictions_{args.measurements}m.png"
+    # Save plot in plots directory
+    plot_file = os.path.join(plots_dir, f'predictions_{args.measurements}m.png')
     plt.savefig(plot_file)
     print(f"Plot saved to {plot_file}")
+    
+    # Also generate CSV file for easy analysis
+    csv_file = os.path.join(data_dir, f'predictions_{args.measurements}.csv')
+    
+    # Create a DataFrame from predictions for CSV export
+    csv_data = {}
+    for model_type, preds in all_predictions.items():
+        csv_data[f'{model_type}_pred'] = preds
+    
+    # If we generated random data, also include the input measurements
+    if args.data_file is None:
+        for i in range(X.shape[1]):
+            csv_data[f'measurement_{i+1}'] = X[:, i]
+    
+    pd.DataFrame(csv_data).to_csv(csv_file, index=True)
+    print(f"CSV data saved to {csv_file}")
     
     return 0
 
